@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Nop.Core;
 using Nop.Core.Domain.Catalog;
@@ -202,7 +203,22 @@ namespace Nop.Services.Orders
 
             return discountAmount;
         }
-        
+
+        protected virtual bool IsFreeShipping(IList<ShoppingCartItem> restoredCart, decimal subTotal)
+        {
+            var customer = restoredCart.GetCustomer();
+            if (customer != null && customer.CustomerRoles.Where(role => role.Active).Any(role => role.FreeShipping))
+                return true;
+
+            if (restoredCart.All(item => item.IsShipEnabled && item.IsFreeShipping))
+                return true;
+
+            if (_shippingSettings.FreeShippingOverXEnabled && subTotal > _shippingSettings.FreeShippingOverXValue)
+                return true;
+
+            return false;
+        }
+
         #endregion
 
         #region Methods
@@ -383,9 +399,421 @@ namespace Nop.Services.Orders
                 subTotalWithDiscount = RoundingHelper.RoundPrice(subTotalWithDiscount);
         }
 
+        /// <summary>
+        /// Update order totals
+        /// </summary>
+        /// <param name="updateOrderParameters">Parameters for the updating order</param>
+        /// <param name="restoredCart">Shopping cart</param>
+        public virtual void UpdateOrderTotals(UpdateOrderParameters updateOrderParameters, IList<ShoppingCartItem> restoredCart)
+        {
+            var updatedOrder = updateOrderParameters.UpdatedOrder;
+            var updatedOrderItem = updateOrderParameters.UpdatedOrderItem;
 
+            //get the customer 
+            var customer = restoredCart.GetCustomer();
 
+            #region Sub total
 
+            var subTotal = decimal.Zero;
+            var subTotalWithTax = decimal.Zero;
+            var subTotalTaxRates = new SortedDictionary<decimal, decimal>();
+
+            foreach (var shoppingCartItem in restoredCart)
+            {
+                var itemSubTotal = decimal.Zero;
+                var itemSubTotalWithTax = decimal.Zero;
+                var taxRate = decimal.Zero;
+                var itemDiscounts = new List<Discount>();
+
+                if (shoppingCartItem.Id == updatedOrderItem.Id)
+                {
+                    var itemPrice = updateOrderParameters.PriceExclTax;
+                    var itemPriceWithTax = updateOrderParameters.PriceInclTax;
+                    var itemDiscountAmount = updateOrderParameters.DiscountAmountExclTax;
+                    var itemDiscountAmountWithTax = updateOrderParameters.DiscountAmountInclTax;
+                    itemSubTotal = updateOrderParameters.SubTotalExclTax;
+                    itemSubTotalWithTax = updateOrderParameters.SubTotalInclTax;
+
+                    if (!updateOrderParameters.SubTotalChanged)
+                    {
+                        if (updateOrderParameters.DiscountAmountChanged)
+                        {
+                            if (updateOrderParameters.PriceChanged)
+                            {
+                                itemSubTotal = (itemPrice - itemDiscountAmount) * shoppingCartItem.Quantity;
+                                itemSubTotalWithTax = (itemPriceWithTax - itemDiscountAmountWithTax) * shoppingCartItem.Quantity;
+                            }
+                            else
+                            {
+                                var unitPrice = _priceCalculationService.GetUnitPrice(shoppingCartItem, false);
+                                itemPrice = _taxService.GetProductPrice(shoppingCartItem.Product, unitPrice, false, customer, out taxRate);
+                                itemPriceWithTax = _taxService.GetProductPrice(shoppingCartItem.Product, unitPrice, true, customer, out taxRate);
+                                itemSubTotal = (itemPrice - itemDiscountAmount) * shoppingCartItem.Quantity;
+                                itemSubTotalWithTax = (itemPriceWithTax - itemDiscountAmountWithTax) * shoppingCartItem.Quantity;
+                            }
+                        }
+                        else
+                        {
+                            if (updateOrderParameters.PriceChanged)
+                            {
+                                itemSubTotal = _priceCalculationService.GetSubTotalWithOverridenPrice(shoppingCartItem, updateOrderParameters.PriceExclTax,
+                                    out itemDiscountAmount, out itemDiscounts);
+                                itemSubTotalWithTax = _priceCalculationService.GetSubTotalWithOverridenPrice(shoppingCartItem, updateOrderParameters.PriceInclTax,
+                                    out itemDiscountAmountWithTax, out itemDiscounts);
+                            }
+                            else
+                            {
+                                var unitPrice = _priceCalculationService.GetUnitPrice(shoppingCartItem);
+                                var unitSubTotal = _priceCalculationService.GetSubTotal(shoppingCartItem, true, out itemDiscountAmount, out itemDiscounts);
+
+                                itemPrice = _taxService.GetProductPrice(shoppingCartItem.Product, unitPrice, false, customer, out taxRate);
+                                itemPriceWithTax = _taxService.GetProductPrice(shoppingCartItem.Product, unitPrice, true, customer, out taxRate);
+                                itemDiscountAmount = _taxService.GetProductPrice(shoppingCartItem.Product, itemDiscountAmount, false, customer, out taxRate);
+                                itemDiscountAmountWithTax = _taxService.GetProductPrice(shoppingCartItem.Product, itemDiscountAmount, true, customer, out taxRate);
+                                itemSubTotal = _taxService.GetProductPrice(shoppingCartItem.Product, unitSubTotal, false, customer, out taxRate);
+                                itemSubTotalWithTax = _taxService.GetProductPrice(shoppingCartItem.Product, unitSubTotal, true, customer, out taxRate);
+                            }
+                        }
+                    }
+
+                    updatedOrderItem.UnitPriceInclTax = itemPriceWithTax;
+                    updatedOrderItem.UnitPriceExclTax = itemPrice;
+                    updatedOrderItem.DiscountAmountInclTax = itemDiscountAmountWithTax;
+                    updatedOrderItem.DiscountAmountExclTax = itemDiscountAmount;
+                    updatedOrderItem.PriceInclTax = itemSubTotalWithTax;
+                    updatedOrderItem.PriceExclTax = itemSubTotal;
+                    updatedOrderItem.Quantity = shoppingCartItem.Quantity;
+
+                }
+                else
+                {
+                    decimal itemDiscountAmount;
+                    var itemPrice = _priceCalculationService.GetSubTotal(shoppingCartItem, true, out itemDiscountAmount, out itemDiscounts);
+                    itemSubTotal = _taxService.GetProductPrice(shoppingCartItem.Product, itemPrice, false, customer, out taxRate);
+                    itemSubTotalWithTax = _taxService.GetProductPrice(shoppingCartItem.Product, itemPrice, true, customer, out taxRate);
+                }
+
+                foreach (var discount in itemDiscounts)
+                    if (!updateOrderParameters.AppliedDiscounts.ContainsDiscount(discount))
+                        updateOrderParameters.AppliedDiscounts.Add(discount);
+
+                subTotal += itemSubTotal;
+                subTotalWithTax += itemSubTotalWithTax;
+
+                //tax rates
+                var itemTaxValue = itemSubTotalWithTax - itemSubTotal;
+                if (taxRate > decimal.Zero && itemTaxValue > decimal.Zero)
+                {
+                    if (!subTotalTaxRates.ContainsKey(taxRate))
+                        subTotalTaxRates.Add(taxRate, itemTaxValue);
+                    else
+                        subTotalTaxRates[taxRate] = subTotalTaxRates[taxRate] + itemTaxValue;
+                }
+            }
+
+            if (subTotalWithTax < decimal.Zero)
+                subTotalWithTax = decimal.Zero;
+
+            if (subTotal < decimal.Zero)
+                subTotal = decimal.Zero;
+
+            //We calculate discount amount on order subtotal excl tax (discount first)
+            //calculate discount amount ('Applied to order subtotal' discount)
+            List<Discount> subTotalDiscounts;
+            var discountAmount = GetOrderSubtotalDiscount(customer, subTotal, out subTotalDiscounts);
+            if (subTotal < discountAmount)
+                discountAmount = subTotal;
+            var discountAmountWithTax = discountAmount;
+
+            //add tax for shopping items
+            var tempTaxRates = new Dictionary<decimal, decimal>(subTotalTaxRates);
+            foreach (var kvp in tempTaxRates)
+            {
+                if (kvp.Value != decimal.Zero && subTotal > decimal.Zero)
+                {
+                    var discountTax = kvp.Value * (discountAmount / subTotal);
+                    discountAmountWithTax += discountTax;
+                    subTotalTaxRates[kvp.Key] = kvp.Value - discountTax;
+                }
+            }
+
+            if (_shoppingCartSettings.RoundPricesDuringCalculation)
+            {
+                subTotalWithTax = RoundingHelper.RoundPrice(subTotalWithTax);
+                subTotal = RoundingHelper.RoundPrice(subTotal);
+                discountAmountWithTax = RoundingHelper.RoundPrice(discountAmountWithTax);
+                discountAmount = RoundingHelper.RoundPrice(discountAmount);
+            }
+
+            updatedOrder.OrderSubtotalInclTax = subTotalWithTax;
+            updatedOrder.OrderSubtotalExclTax = subTotal;
+            updatedOrder.OrderSubTotalDiscountInclTax = discountAmountWithTax;
+            updatedOrder.OrderSubTotalDiscountExclTax = discountAmount;
+
+            foreach (var discount in subTotalDiscounts)
+                if (!updateOrderParameters.AppliedDiscounts.ContainsDiscount(discount))
+                    updateOrderParameters.AppliedDiscounts.Add(discount);
+
+            #endregion
+
+            #region Shipping
+
+            var shippingTotalInclTax = decimal.Zero;
+            var shippingTotalExclTax = decimal.Zero;
+            var shippingTaxRate = decimal.Zero;
+
+            if (restoredCart.RequiresShipping())
+            {
+                if (!IsFreeShipping(restoredCart, _shippingSettings.FreeShippingOverXIncludingTax ? subTotalWithTax : subTotal))
+                {
+                    var shippingTotal = decimal.Zero;
+                    if (!string.IsNullOrEmpty(updatedOrder.ShippingRateComputationMethodSystemName))
+                    {
+                        if (updatedOrder.PickUpInStore)
+                        {
+                            if (_shippingSettings.AllowPickUpInStore)
+                            {
+                                var pickupPointsResponse = _shippingService.GetPickupPoints(updatedOrder.BillingAddress,
+                                    updatedOrder.ShippingRateComputationMethodSystemName, _storeContext.CurrentStore.Id);
+                                if (pickupPointsResponse.Success)
+                                {
+                                    var selectedPickupPoint = pickupPointsResponse.PickupPoints.FirstOrDefault(point => updatedOrder.ShippingMethod.Contains(point.Name));
+                                    if (selectedPickupPoint != null)
+                                        shippingTotal = selectedPickupPoint.PickupFee;
+                                    else
+                                        updateOrderParameters.Warnings.Add(string.Format("Shipping method {0} could not be loaded", updatedOrder.ShippingMethod));
+                                }
+                                else
+                                    updateOrderParameters.Warnings.AddRange(pickupPointsResponse.Errors);
+                            }
+                            else
+                                updateOrderParameters.Warnings.Add("Pick up in store is not available");
+                        }
+                        else
+                        {
+                            var shippingOptionsResponse = _shippingService.GetShippingOptions(restoredCart,
+                                updatedOrder.ShippingAddress, updatedOrder.ShippingRateComputationMethodSystemName, _storeContext.CurrentStore.Id);
+                            if (shippingOptionsResponse.Success)
+                            {
+                                var shippingOption = shippingOptionsResponse.ShippingOptions.FirstOrDefault(option => updatedOrder.ShippingMethod.Contains(option.Name));
+                                if (shippingOption != null)
+                                    shippingTotal = shippingOption.Rate;
+                                else
+                                    updateOrderParameters.Warnings.Add(string.Format("Shipping method {0} could not be loaded", updatedOrder.ShippingMethod));
+                            }
+                            else
+                                updateOrderParameters.Warnings.AddRange(shippingOptionsResponse.Errors);
+                        }
+                    }
+                    else
+                    {
+                        if (_shippingSettings.AllowPickUpInStore)
+                        {
+                            var pickupPointsResponse = _shippingService.GetPickupPoints(updatedOrder.BillingAddress, null, _storeContext.CurrentStore.Id);
+                            if (pickupPointsResponse.Success)
+                            {
+                                updateOrderParameters.PickupPoint = pickupPointsResponse.PickupPoints.OrderBy(point => point.PickupFee).First();
+                                shippingTotal = updateOrderParameters.PickupPoint.PickupFee;
+                            }
+                            else
+                                updateOrderParameters.Warnings.AddRange(pickupPointsResponse.Errors);
+                        }
+                        else
+                            updateOrderParameters.Warnings.Add("Pick up in store is not available");
+
+                        if (updateOrderParameters.PickupPoint == null)
+                        {
+                            var shippingRateComputationMethods = _shippingService.LoadActiveShippingRateComputationMethods(_storeContext.CurrentStore.Id);
+                            if (shippingRateComputationMethods.Any())
+                            {
+                                var shippingOptionsResponse = _shippingService.GetShippingOptions(restoredCart, customer.ShippingAddress, null, _storeContext.CurrentStore.Id);
+                                if (shippingOptionsResponse.Success)
+                                {
+                                    var shippingOption = shippingOptionsResponse.ShippingOptions.OrderBy(option => option.Rate).First();
+                                    updatedOrder.ShippingRateComputationMethodSystemName = shippingOption.ShippingRateComputationMethodSystemName;
+                                    updatedOrder.ShippingMethod = shippingOption.Name;
+                                    updatedOrder.ShippingAddress = (Address)customer.ShippingAddress.Clone();
+                                    shippingTotal = shippingOption.Rate;
+                                }
+                                else
+                                    updateOrderParameters.Warnings.AddRange(shippingOptionsResponse.Errors);
+                            }
+                            else
+                                updateOrderParameters.Warnings.Add("Shipping rate computation method could not be loaded");
+                        }
+                    }
+
+                    shippingTotal += restoredCart.Where(item => item.IsShipEnabled && !item.IsFreeShipping).Sum(item => item.Product.AdditionalShippingCharge);
+                    List<Discount> shippingTotalDiscounts;
+                    shippingTotal -= GetShippingDiscount(customer, shippingTotal, out shippingTotalDiscounts);
+                    if (shippingTotal < decimal.Zero)
+                        shippingTotal = decimal.Zero;
+
+                    shippingTotalInclTax = _taxService.GetShippingPrice(shippingTotal, true, customer, out shippingTaxRate);
+                    shippingTotalExclTax = _taxService.GetShippingPrice(shippingTotal, false, customer);
+
+                    //round
+                    if (_shoppingCartSettings.RoundPricesDuringCalculation)
+                    {
+                        shippingTotalInclTax = RoundingHelper.RoundPrice(shippingTotalInclTax);
+                        shippingTotalExclTax = RoundingHelper.RoundPrice(shippingTotalExclTax);
+                    }
+
+                    if (updatedOrder.ShippingStatus == ShippingStatus.ShippingNotRequired || updatedOrder.ShippingStatus == ShippingStatus.NotYetShipped)
+                        updatedOrder.ShippingStatus = ShippingStatus.NotYetShipped;
+                    else
+                        updatedOrder.ShippingStatus = ShippingStatus.PartiallyShipped;
+
+                    foreach (var discount in shippingTotalDiscounts)
+                        if (!updateOrderParameters.AppliedDiscounts.ContainsDiscount(discount))
+                            updateOrderParameters.AppliedDiscounts.Add(discount);
+                }
+            }
+            else
+                updatedOrder.ShippingStatus = ShippingStatus.ShippingNotRequired;
+
+            updatedOrder.OrderShippingInclTax = shippingTotalInclTax;
+            updatedOrder.OrderShippingExclTax = shippingTotalExclTax;
+
+            #endregion
+
+            #region Payment
+
+            var paymentAdditionalFee = _paymentService.GetAdditionalHandlingFee(restoredCart, updatedOrder.PaymentMethodSystemName);
+            decimal paymentTaxRate;
+            updatedOrder.PaymentMethodAdditionalFeeInclTax = _taxService.GetPaymentMethodAdditionalFee(paymentAdditionalFee, true, customer, out paymentTaxRate);
+            updatedOrder.PaymentMethodAdditionalFeeExclTax = _taxService.GetPaymentMethodAdditionalFee(paymentAdditionalFee, false, customer);
+
+            #endregion
+
+            #region Tax rates
+
+            var taxRates = new SortedDictionary<decimal, decimal>();
+
+            //order sub total (items + checkout attributes)
+            var subTotalTax = decimal.Zero;
+            foreach (var kvp in subTotalTaxRates)
+            {
+                subTotalTax += kvp.Value;
+                if (kvp.Key > decimal.Zero && kvp.Value > decimal.Zero)
+                {
+                    if (!taxRates.ContainsKey(kvp.Key))
+                        taxRates.Add(kvp.Key, kvp.Value);
+                    else
+                        taxRates[kvp.Key] = taxRates[kvp.Key] + kvp.Value;
+                }
+            }
+
+            //shipping
+            var shippingTax = decimal.Zero;
+            if (_taxSettings.ShippingIsTaxable)
+            {
+                shippingTax = shippingTotalInclTax - shippingTotalExclTax;
+                if (shippingTax < decimal.Zero)
+                    shippingTax = decimal.Zero;
+
+                //tax rates
+                if (shippingTaxRate > decimal.Zero && shippingTax > decimal.Zero)
+                {
+                    if (!taxRates.ContainsKey(shippingTaxRate))
+                        taxRates.Add(shippingTaxRate, shippingTax);
+                    else
+                        taxRates[shippingTaxRate] = taxRates[shippingTaxRate] + shippingTax;
+                }
+            }
+
+            //payment method additional fee
+            var paymentMethodAdditionalFeeTax = decimal.Zero;
+            if (_taxSettings.PaymentMethodAdditionalFeeIsTaxable)
+            {
+                paymentMethodAdditionalFeeTax = updatedOrder.PaymentMethodAdditionalFeeInclTax - updatedOrder.PaymentMethodAdditionalFeeExclTax;
+                if (paymentMethodAdditionalFeeTax < decimal.Zero)
+                    paymentMethodAdditionalFeeTax = decimal.Zero;
+
+                if (paymentTaxRate > decimal.Zero && paymentMethodAdditionalFeeTax > decimal.Zero)
+                {
+                    if (!taxRates.ContainsKey(paymentTaxRate))
+                        taxRates.Add(paymentTaxRate, paymentMethodAdditionalFeeTax);
+                    else
+                        taxRates[paymentTaxRate] = taxRates[paymentTaxRate] + paymentMethodAdditionalFeeTax;
+                }
+            }
+
+            //add at least one tax rate (0%)
+            if (!taxRates.Any())
+                taxRates.Add(decimal.Zero, decimal.Zero);
+
+            //summarize taxes
+            var taxTotal = subTotalTax + shippingTax + paymentMethodAdditionalFeeTax;
+            if (taxTotal < decimal.Zero)
+                taxTotal = decimal.Zero;
+
+            //round tax
+            if (_shoppingCartSettings.RoundPricesDuringCalculation)
+                taxTotal = RoundingHelper.RoundPrice(taxTotal);
+
+            updatedOrder.OrderTax = taxTotal;
+            updatedOrder.TaxRates = taxRates.Aggregate(string.Empty, (current, next) =>
+                string.Format("{0}{1}:{2};   ", current, next.Key.ToString(CultureInfo.InvariantCulture), next.Value.ToString(CultureInfo.InvariantCulture)));
+
+            #endregion
+
+            #region Total
+
+            var total = (subTotal - discountAmount) + shippingTotalExclTax + updatedOrder.PaymentMethodAdditionalFeeExclTax + taxTotal;
+            List<Discount> orderAppliedDiscounts;
+            var discountAmountTotal = GetOrderTotalDiscount(customer, total, out orderAppliedDiscounts);     
+            if (total < discountAmountTotal)
+                discountAmountTotal = total;
+            total -= discountAmountTotal;
+
+            //applied giftcards
+            foreach (var giftCard in _giftCardService.GetAllGiftCards().Where(giftcard => giftcard.GiftCardUsageHistory.Any(history => history.UsedWithOrderId == updatedOrder.Id)))
+            {
+                if (total > decimal.Zero)
+                {
+                    var remainingAmount = giftCard.GiftCardUsageHistory.Where(history => history.UsedWithOrderId == updatedOrder.Id).Sum(history => history.UsedValue);
+                    var amountCanBeUsed = total > remainingAmount ? remainingAmount : total;
+                    total -= amountCanBeUsed;
+                }
+            }
+
+            //reward points
+            var rewardPointsOfOrder = _rewardPointService.GetRewardPointsHistory(customer.Id, true).FirstOrDefault(history => history.UsedWithOrder == updatedOrder);
+            if (rewardPointsOfOrder != null)
+            {
+                var rewardPointsAmount = ConvertRewardPointsToAmount(-rewardPointsOfOrder.Points);
+                if (total > decimal.Zero)
+                {
+                    if (total < rewardPointsAmount)
+                        rewardPointsAmount = total;
+                    total -= rewardPointsAmount;
+
+                    if (rewardPointsAmount != rewardPointsOfOrder.UsedAmount)
+                    {
+                        rewardPointsOfOrder.CreatedOnUtc = DateTime.UtcNow;
+                        rewardPointsOfOrder.UsedAmount = rewardPointsAmount;
+                        _rewardPointService.UpdateRewardPointsHistoryEntry(rewardPointsOfOrder);
+                    }
+                }
+            }
+
+            //rounding
+            if (total < decimal.Zero)
+                total = decimal.Zero;
+            if (_shoppingCartSettings.RoundPricesDuringCalculation)
+                total = RoundingHelper.RoundPrice(total);
+
+            updatedOrder.OrderDiscount = discountAmountTotal;
+            updatedOrder.OrderTotal = total;
+
+            //discount history
+            foreach (var disc in orderAppliedDiscounts)
+                if (!updateOrderParameters.AppliedDiscounts.ContainsDiscount(disc))
+                    updateOrderParameters.AppliedDiscounts.Add(disc);
+
+            #endregion
+        }
 
         /// <summary>
         /// Gets shopping cart additional shipping charge

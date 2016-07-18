@@ -161,6 +161,12 @@ namespace Nop.Services.Orders
 
 
 
+        /// <summary>
+        /// Update order totals
+        /// </summary>
+        /// <param name="updateOrderParameters">Parameters for the updating order</param>
+        /// <param name="restoredCart">Shopping cart</param>
+        void UpdateOrderTotals(UpdateOrderParameters updateOrderParameters, IList<ShoppingCartItem> restoredCart);
 
         /// <summary>
         /// Converts existing reward points to amount

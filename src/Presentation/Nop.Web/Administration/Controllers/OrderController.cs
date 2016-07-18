@@ -2135,22 +2135,7 @@ namespace Nop.Admin.Controllers
                 priceExclTax = orderItem.PriceExclTax;
 
             if (quantity > 0)
-            {
-                int qtyDifference = orderItem.Quantity - quantity;
-
-                orderItem.UnitPriceInclTax = unitPriceInclTax;
-                orderItem.UnitPriceExclTax = unitPriceExclTax;
-                orderItem.Quantity = quantity;
-                orderItem.DiscountAmountInclTax = discountInclTax;
-                orderItem.DiscountAmountExclTax = discountExclTax;
-                orderItem.PriceInclTax = priceInclTax;
-                orderItem.PriceExclTax = priceExclTax;
-                _orderService.UpdateOrder(order);
-
-                //adjust inventory
-                _productService.AdjustInventory(orderItem.Product, qtyDifference, orderItem.AttributesXml);
-
-            }
+                _productService.AdjustInventory(orderItem.Product, orderItem.Quantity - quantity, orderItem.AttributesXml);
             else
             {
                 //adjust inventory
@@ -2159,6 +2144,23 @@ namespace Nop.Admin.Controllers
                 //delete item
                 _orderService.DeleteOrderItem(orderItem);
             }
+
+            var updateOrderParameters = new UpdateOrderParameters
+            {
+                UpdatedOrder = order,
+                UpdatedOrderItem = orderItem,
+                PriceInclTax = unitPriceInclTax,
+                PriceExclTax = unitPriceExclTax,
+                DiscountAmountInclTax = discountInclTax,
+                DiscountAmountExclTax = discountExclTax,
+                SubTotalInclTax = priceInclTax,
+                SubTotalExclTax = priceExclTax,
+                Quantity = quantity,
+                PriceChanged = unitPriceInclTax - orderItem.UnitPriceInclTax != 0 || unitPriceExclTax - orderItem.UnitPriceExclTax != 0,
+                DiscountAmountChanged = discountInclTax - orderItem.DiscountAmountInclTax != 0 || discountExclTax - orderItem.DiscountAmountExclTax != 0,
+                SubTotalChanged = priceInclTax - orderItem.PriceInclTax != 0 || priceExclTax - orderItem.PriceExclTax != 0
+            };
+            _orderProcessingService.UpdateOrderTotals(updateOrderParameters);
 
             //add a note
             order.OrderNotes.Add(new OrderNote
@@ -2229,6 +2231,15 @@ namespace Nop.Admin.Controllers
 
                 //delete item
                 _orderService.DeleteOrderItem(orderItem);
+
+                var updateOrderParameters = new UpdateOrderParameters
+                {
+                    UpdatedOrder = order,
+                    UpdatedOrderItem = orderItem
+                };
+                _orderProcessingService.UpdateOrderTotals(updateOrderParameters);
+
+
 
                 //add a note
                 order.OrderNotes.Add(new OrderNote
@@ -2631,6 +2642,20 @@ namespace Nop.Admin.Controllers
 
                 //adjust inventory
                 _productService.AdjustInventory(orderItem.Product, -orderItem.Quantity, orderItem.AttributesXml);
+
+                var updateOrderParameters = new UpdateOrderParameters
+                {
+                    UpdatedOrder = order,
+                    UpdatedOrderItem = orderItem,
+                    PriceInclTax = unitPriceInclTax,
+                    PriceExclTax = unitPriceExclTax,
+                    SubTotalInclTax = priceInclTax,
+                    SubTotalExclTax = priceExclTax,
+                    Quantity = quantity,
+                    PriceChanged = unitPriceInclTax - orderItem.UnitPriceInclTax != 0 || unitPriceExclTax - orderItem.UnitPriceExclTax != 0,
+                    SubTotalChanged = priceInclTax - orderItem.PriceInclTax != 0 || priceExclTax - orderItem.PriceExclTax != 0
+                };
+                _orderProcessingService.UpdateOrderTotals(updateOrderParameters);
 
                 //add a note
                 order.OrderNotes.Add(new OrderNote

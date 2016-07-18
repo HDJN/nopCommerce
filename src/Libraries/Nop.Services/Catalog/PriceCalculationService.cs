@@ -739,8 +739,57 @@ namespace Nop.Services.Catalog
             }
             return subTotal;
         }
-        
 
+
+        /// <summary>
+        /// Gets the shopping cart item sub total with overriden price
+        /// </summary>
+        /// <param name="updatedShoppingCartItem">The updated shopping cart item</param>
+        /// <param name="price">Overriden price</param>
+        /// <param name="discountAmount">Applied discount amount</param>
+        /// <param name="appliedDiscounts">Applied discounts</param>
+        /// <returns></returns>
+        public virtual decimal GetSubTotalWithOverridenPrice(ShoppingCartItem updatedShoppingCartItem, decimal price,
+            out decimal discountAmount, out List<Discount> appliedDiscounts)
+        {
+            ////summarize price of all attributes
+            //var attributesTotalPrice = _productAttributeParser.ParseProductAttributeValues(updatedShoppingCartItem.AttributesXml)
+            //    .Sum(attributeValue => GetProductAttributeValuePriceAdjustment(attributeValue));
+
+            //manualPrice += attributesTotalPrice;
+
+            //if (updatedShoppingCartItem.Product.IsRental)
+            //    if (updatedShoppingCartItem.RentalStartDateUtc.HasValue && updatedShoppingCartItem.RentalStartDateUtc.HasValue)
+            //        manualPrice *= updatedShoppingCartItem.Product.GetRentalPeriods(updatedShoppingCartItem.RentalStartDateUtc.Value, updatedShoppingCartItem.RentalStartDateUtc.Value);
+
+            discountAmount = GetDiscountAmount(updatedShoppingCartItem.Product, updatedShoppingCartItem.Customer, price, out appliedDiscounts);
+            var priceWithDiscount = price - discountAmount;
+
+            if (priceWithDiscount < decimal.Zero)
+                priceWithDiscount = decimal.Zero;
+
+            //rounding
+            if (_shoppingCartSettings.RoundPricesDuringCalculation)
+                priceWithDiscount = RoundingHelper.RoundPrice(priceWithDiscount);
+
+            //discount
+            if (appliedDiscounts == null)
+                appliedDiscounts = new List<Discount>();
+            if (appliedDiscounts.Count == 1)
+            {
+                //we can properly use "MaximumDiscountedQuantity" property only for one discount (not cumulative ones)
+                var oneAndOnlyDiscount = appliedDiscounts.First();
+                if (oneAndOnlyDiscount.MaximumDiscountedQuantity.HasValue &&
+                    updatedShoppingCartItem.Quantity > oneAndOnlyDiscount.MaximumDiscountedQuantity.Value)
+                {
+                    //we cannot apply discount for all shopping cart items
+                    return priceWithDiscount * oneAndOnlyDiscount.MaximumDiscountedQuantity.Value +
+                        price * (updatedShoppingCartItem.Quantity - oneAndOnlyDiscount.MaximumDiscountedQuantity.Value);
+                }
+            }
+
+            return priceWithDiscount * updatedShoppingCartItem.Quantity;
+        }
 
         /// <summary>
         /// Gets the product cost (one item)
